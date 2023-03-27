@@ -1,15 +1,13 @@
 import json
-import httpx
-import jinja2
 import math
 from pathlib import Path
 from typing import List, Union
+import httpx
+import jinja2
 from nonebot import get_driver
 from nonebot.log import logger
 from nonebot_plugin_apscheduler import scheduler
 from .HTP2 import html_to_pic
-
-
 from .config import Config
 
 dd_config = Config.parse_obj(get_driver().config.dict())
@@ -23,7 +21,7 @@ env = jinja2.Environment(
     loader=jinja2.FileSystemLoader(template_path), enable_async=True
 )
 
-proxies = { "http://": None, "https://": None}
+
 async def update_vtb_list():
     vtb_list = []
     urls = [
@@ -31,7 +29,7 @@ async def update_vtb_list():
         "https://api.tokyo.vtbs.moe/v1/short",
         "https://vtbs.musedash.moe/v1/short",
     ]
-    async with httpx.AsyncClient(proxies=proxies) as client:
+    async with httpx.AsyncClient() as client:
         for url in urls:
             try:
                 resp = await client.get(url, timeout=20)
@@ -39,11 +37,17 @@ async def update_vtb_list():
                 if not result:
                     continue
                 for info in result:
+                    if info.get("uid", None) and info.get("uname", None):
+                        vtb_list.append(
+                            {"mid": int(info["uid"]), "uname": info["uname"]}
+                        )
                     if info.get("mid", None) and info.get("uname", None):
                         vtb_list.append(info)
                 break
             except httpx.TimeoutException:
                 logger.warning(f"Get {url} timeout")
+            except Exception:
+                logger.exception(f"Error when getting {url}, ignore")
     dump_vtb_list(vtb_list)
 
 
@@ -88,12 +92,14 @@ async def get_uid_by_name(name: str) -> int:
     try:
         url = "http://api.bilibili.com/x/web-interface/search/type"
         params = {"search_type": "bili_user", "keyword": name}
-        async with httpx.AsyncClient(proxies=proxies) as client:
-            resp = await client.get(url, params=params, timeout=10)
+        headers = {"cookie": dd_config.bilibili_cookie}
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.get("https://www.bilibili.com", headers=headers)
+            resp = await client.get(url, params=params)
             result = resp.json()
-        for user in result["data"]["result"]:
-            if user["uname"] == name:
-                return user["mid"]
+            for user in result["data"]["result"]:
+                if user["uname"] == name:
+                    return user["mid"]
         return 0
     except (KeyError, IndexError, httpx.TimeoutException) as e:
         logger.warning(f"Error in get_uid_by_name({name}): {e}")
@@ -104,10 +110,10 @@ async def get_user_info(uid: int) -> dict:
     try:
         url = "https://account.bilibili.com/api/member/getCardByMid"
         params = {"mid": uid}
-        async with httpx.AsyncClient(proxies=proxies) as client:
-            resp = await client.get(url, params=params, timeout=10)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params)
             result = resp.json()
-        return result["card"]
+            return result["card"]
     except (KeyError, IndexError, httpx.TimeoutException) as e:
         logger.warning(f"Error in get_user_info({uid}): {e}")
         return {}
@@ -118,10 +124,10 @@ async def get_medals(uid: int) -> List[dict]:
         url = "https://api.live.bilibili.com/xlive/web-ucenter/user/MedalWall"
         params = {"target_id": uid}
         headers = {"cookie": dd_config.bilibili_cookie}
-        async with httpx.AsyncClient(proxies=proxies) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, params=params, headers=headers)
             result = resp.json()
-        return result["data"]["list"]
+            return result["data"]["list"]
     except (KeyError, IndexError, httpx.TimeoutException) as e:
         logger.warning(f"Error in get_medals({uid}): {e}")
         return []
@@ -154,7 +160,12 @@ async def get_reply(name: str) -> Union[str, bytes]:
         uid = await get_uid_by_name(name)
     user_info = await get_user_info(uid)
     if not user_info:
-        return "获取用户信息失败，请检查名称或稍后再试"
+        return "获取用户信息失败，请检查名称或使用uid查询"
+
+    attentions = user_info.get("attentions", [])
+    follows_num = int(user_info["attention"])
+    if not attentions and follows_num:
+        return "获取用户关注列表失败，关注列表可能未公开"
 
     vtb_list = await get_vtb_list()
     if not vtb_list:
@@ -164,23 +175,21 @@ async def get_reply(name: str) -> Union[str, bytes]:
     medal_dict = {medal["target_name"]: medal for medal in medals}
 
     vtb_dict = {info["mid"]: info for info in vtb_list}
-    vtbs = [
-        info for uid, info in vtb_dict.items() if uid in user_info.get("attentions", [])
-    ]
+    vtbs = [info for uid, info in vtb_dict.items() if uid in attentions]
     vtbs = [format_vtb_info(info, medal_dict) for info in vtbs]
 
-    follows_num = int(user_info["attention"])
     vtbs_num = len(vtbs)
     percent = vtbs_num / follows_num * 100 if follows_num else 0
+    num_per_col = math.ceil(vtbs_num / math.ceil(vtbs_num / 100)) if vtbs_num else 1
     result = {
         "name": user_info["name"],
         "uid": user_info["mid"],
         "face": user_info["face"],
         "fans": user_info["fans"],
-        "follows": user_info["attention"],
+        "follows": follows_num,
         "percent": f"{percent:.2f}% ({vtbs_num}/{follows_num})",
         "vtbs": vtbs,
-        "p": math.ceil(vtbs_num/math.ceil(vtbs_num/100))
+        "num_per_col": num_per_col,
     }
     template = env.get_template("info.html")
     content = await template.render_async(info=result)
